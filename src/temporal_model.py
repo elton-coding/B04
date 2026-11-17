@@ -16,12 +16,13 @@ from inputs import normalize_columns
 
 
 SIGNAL = ("param1", "param2", "param3")
-POSITION = ("sensor_longitude", "sensor_latitude")
+POSITION = ("sensor_longitude", "sensor_latitude", "sensor_height")
 MEASUREMENTS = SIGNAL + ("toa", "doa") + POSITION
 TEXT = PULSE_KEY + ("platform_id", "datetime")
 LABELS = ("target_class", "target_state")
 SEED = 42
 FEATURE_VERSION = 1
+CONTEXT_WIDTH_US = {1: 256_000, 2: 2_048_000}
 CHUNK_SIZE = 262_144
 STATE_KEEP_RATES = (0.12, 1.0, 0.30)
 STATE_PRIOR_STRENGTH = 0.8
@@ -52,7 +53,7 @@ def is_ordered(path, limit=None):
     return True
 
 
-def pulse_batches(path, *, labeled=False, limit=None, ordered=None):
+def pulse_batches(path, *, labeled=False, limit=None, ordered=None, feature_version=FEATURE_VERSION):
     fields = TEXT + MEASUREMENTS + (LABELS if labeled else ())
     if ordered is None:
         ordered = is_ordered(path, limit)
@@ -76,7 +77,7 @@ def pulse_batches(path, *, labeled=False, limit=None, ordered=None):
             raise ValueError(f"{path}: empty pulse identity, platform or timestamp")
         # Hold back the last context block so CSV chunk boundaries do not split it.
         batch = pd.concat((pending, batch), ignore_index=True)
-        block = np.floor_divide(batch.toa.to_numpy(), 256_000).astype("int64")
+        block = np.floor_divide(batch.toa.to_numpy(), CONTEXT_WIDTH_US[feature_version]).astype("int64")
         boundary = np.r_[True, block[1:] != block[:-1]]
         cut = np.flatnonzero(boundary)[-1]
         pending = batch.iloc[cut:].copy()
@@ -95,7 +96,41 @@ def context_groups(batch, width_us, bearing_width, offset=0):
     ]
 
 
-def pulse_features(batch):
+def burst_features(batch):
+    toa = batch.toa
+    signal_bin = np.floor((batch.param3.to_numpy() + 2) / 4).astype("int64")
+    subwindow = (toa // 16_000).astype("int64")
+    parts = []
+    for width, angle, offset in ((64_000, 8, 4), (512_000, 10, 5), (2_048_000, 12, 0)):
+        groups = context_groups(batch, width, angle, offset) + [signal_bin]
+        arrivals = toa.groupby(groups, sort=False)
+        gap = (toa - arrivals.shift()).clip(0, width)
+        next_gap = (arrivals.shift(-1) - toa).clip(0, width)
+        log_gaps = np.log1p(gap)
+        gap_stats = log_gaps.groupby(groups, sort=False)
+        occupied = subwindow.groupby(groups, sort=False).transform("nunique")
+        count = arrivals.transform("size")
+        start = arrivals.transform("min")
+        finish = arrivals.transform("max")
+        widths = batch.param2.groupby(groups, sort=False)
+        parts.extend((
+            np.log1p(gap.fillna(width)),
+            np.log1p(next_gap.fillna(width)),
+            gap_stats.transform("mean").fillna(np.log1p(width)),
+            gap_stats.transform("std").fillna(0),
+            (gap > 5_000).where(gap.notna()).astype(float).groupby(groups, sort=False)
+                .transform("mean").fillna(0),
+            np.log(occupied),
+            np.log(count / occupied),
+            np.log1p(toa - start),
+            np.log1p(finish - toa),
+            widths.transform("mean"),
+            widths.transform("std").fillna(0),
+        ))
+    return parts
+
+
+def pulse_features(batch, feature_version=FEATURE_VERSION):
     values = batch[list(SIGNAL)].astype("float32")
     parts = [values.to_numpy()]
     for width, angle, offset in ((32_000, 8, 0), (256_000, 12, 6)):
@@ -110,12 +145,15 @@ def pulse_features(batch):
             np.log1p((batch.toa - times.shift()).clip(0, width).fillna(width).to_numpy())[:, None],
             np.log1p((times.shift(-1) - batch.toa).clip(0, width).fillna(width).to_numpy())[:, None],
         ))
+    if feature_version == 2:
+        parts.extend(burst_features(batch))
     return np.ascontiguousarray(np.column_stack(parts), dtype=np.float32)
 
 
 class PulseClassifier(nn.Module):
-    def __init__(self, features):
+    def __init__(self, features, feature_version=FEATURE_VERSION):
         super().__init__()
+        self.feature_version = feature_version
         self.register_buffer("center", torch.zeros(features))
         self.register_buffer("scale", torch.ones(features))
         self.register_buffer("state_logit_bias", torch.zeros(len(STATES)), persistent=False)
@@ -141,21 +179,21 @@ def label_codes(batch, name, labels):
     return codes
 
 
-def train(path, destination, *, epochs=16, limit=None):
+def train(path, destination, *, epochs=16, limit=None, feature_version=FEATURE_VERSION):
     device = cuda_device()
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
     features, types, states = [], [], []
     type_counts = np.zeros(len(CLASSES), dtype=np.int64)
     state_counts = np.zeros(len(STATES), dtype=np.int64)
-    for batch in pulse_batches(path, labeled=True, limit=limit):
+    for batch in pulse_batches(path, labeled=True, limit=limit, feature_version=feature_version):
         t = label_codes(batch, "target_class", CLASSES)
         s = label_codes(batch, "target_state", STATES)
         type_counts += np.bincount(t, minlength=len(CLASSES))
         state_counts += np.bincount(s, minlength=len(STATES))
         # Sample after constructing neighbors. Retain extra labeled tracking pulses.
         keep = rng.random(len(batch)) < np.asarray(STATE_KEEP_RATES)[s]
-        features.append(pulse_features(batch)[keep])
+        features.append(pulse_features(batch, feature_version)[keep])
         types.append(t[keep])
         states.append(s[keep])
     if not features or not any(len(part) for part in features):
@@ -163,7 +201,7 @@ def train(path, destination, *, epochs=16, limit=None):
     x = torch.as_tensor(np.concatenate(features), device=device)
     y = torch.as_tensor(np.concatenate(types), device=device, dtype=torch.long)
     z = torch.as_tensor(np.concatenate(states), device=device, dtype=torch.long)
-    model = PulseClassifier(x.shape[1]).to(device)
+    model = PulseClassifier(x.shape[1], feature_version).to(device)
     model.center.copy_(x.mean(0))
     model.scale.copy_(x.std(0, unbiased=False).clamp_min(0.001))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002)
@@ -186,7 +224,7 @@ def train(path, destination, *, epochs=16, limit=None):
         temporary = Path(stream.name)
     try:
         torch.save({
-            "feature_version": FEATURE_VERSION, "model": model.state_dict(), "width": x.shape[1],
+            "feature_version": feature_version, "model": model.state_dict(), "width": x.shape[1],
             "seed": SEED, "class_counts": type_counts.tolist(), "state_counts": state_counts.tolist(),
         }, temporary)
         temporary.replace(destination)
@@ -197,9 +235,10 @@ def train(path, destination, *, epochs=16, limit=None):
 
 def load_model(path, device):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint["feature_version"] != FEATURE_VERSION:
-        raise ValueError("checkpoint uses a different pulse feature version")
-    model = PulseClassifier(checkpoint["width"]).to(device)
+    feature_version = checkpoint["feature_version"]
+    if feature_version not in CONTEXT_WIDTH_US:
+        raise ValueError("checkpoint uses an unsupported pulse feature version")
+    model = PulseClassifier(checkpoint["width"], feature_version).to(device)
     model.load_state_dict(checkpoint["model"])
     counts = torch.as_tensor(checkpoint["state_counts"], dtype=torch.float32, device=device)
     rates = torch.as_tensor(STATE_KEEP_RATES, device=device)
@@ -216,11 +255,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--feature-version", type=int, choices=tuple(CONTEXT_WIDTH_US), default=FEATURE_VERSION)
     args = parser.parse_args()
     if args.epochs < 1 or (args.limit is not None and args.limit < 1):
         parser.error("--epochs and --limit must be positive")
     try:
-        train(args.train_a, args.output, epochs=args.epochs, limit=args.limit)
+        train(args.train_a, args.output, epochs=args.epochs, limit=args.limit,
+              feature_version=args.feature_version)
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(2, f"Training failed: {error}\n")
 

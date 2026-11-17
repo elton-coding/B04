@@ -23,6 +23,8 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path(os.getenv("OUTPUT_DIR", "/output")))
     parser.add_argument("--model", type=Path, default=Path(os.getenv("B04_MODEL", "model/temporal.pt")),
                         help="CUDA candidate checkpoint for --task all")
+    parser.add_argument("--association", choices=("bearing", "arrival"), default="bearing",
+                        help="Association evidence used by --task all")
     parser.add_argument("--limit", type=positive_int, help="Process at most this many rows per input")
     args = parser.parse_args()
 
@@ -39,7 +41,8 @@ def main() -> None:
             from predict import predict
 
             sources = find_inputs(args.data_root, "test")
-            predict(sources["A"], sources["B"], args.model, args.out_dir, args.limit)
+            predict(sources["A"], sources["B"], args.model, args.out_dir, args.limit,
+                    association=args.association)
             return
         if args.task == "features":
             from pulse_features import write_pulse_features
