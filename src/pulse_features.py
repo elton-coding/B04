@@ -14,10 +14,10 @@ from gpu_check import cuda_device
 from inputs import normalize_columns
 
 
-TEXT_FIELDS = (
+REQUIRED_TEXT_FIELDS = (
     "scenario_id", "data_version", "pulse_id", "platform_id", "datetime",
-    "target_id", "target_class", "target_state",
 )
+TEXT_FIELDS = REQUIRED_TEXT_FIELDS + ("target_id", "target_class", "target_state")
 MEASUREMENTS = (
     "toa", "param1", "param2", "param3", "doa",
     "sensor_longitude", "sensor_latitude", "sensor_height",
@@ -32,7 +32,10 @@ SCHEMA = pa.schema(
 def build_batch(rows: tuple[dict[str, str], ...], device: torch.device) -> pa.Table:
     columns: dict[str, object] = {}
     for field in TEXT_FIELDS:
-        columns[field] = [(row.get(field) or "").strip() or None for row in rows]
+        values = [(row.get(field) or "").strip() or None for row in rows]
+        if field in REQUIRED_TEXT_FIELDS and None in values:
+            raise ValueError(f"{field} must be present for every pulse")
+        columns[field] = values
     for field in MEASUREMENTS:
         values = [float(row[field]) for row in rows]
         if not all(math.isfinite(value) for value in values):

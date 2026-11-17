@@ -92,6 +92,8 @@ def audit_inputs(root: Path, split: str, limit: int | None = None) -> dict:
     observations = {sensor: summarize(path, sensor, limit) for sensor, path in paths.items()}
     a_series = observations["A"]["scenarios"]
     b_series = observations["B"]["scenarios"]
-    if a_series != b_series or any(not name or version != split for name, version in a_series):
-        raise ValueError("A and B must contain the same scenario IDs and requested data version")
+    if any(not scenario.strip() or version != split for scenario, version in a_series + b_series):
+        raise ValueError("A and B rows must have a scenario ID and the requested data version")
+    if limit is None and a_series != b_series:
+        raise ValueError("Full audit found different scenario IDs in the A and B files")
     return {"split": split, "row_limit_per_table": limit, "observations": observations}

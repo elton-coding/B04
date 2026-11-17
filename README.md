@@ -20,11 +20,16 @@
 wsl -d Ubuntu-24.04 --cd /mnt/d/Source/B04
 ```
 
-在 Ubuntu 中建立或查看项目环境。
+首次创建环境，在 Ubuntu 执行以下命令。
 
 ```bash
 uv venv --python /usr/bin/python3.12 ~/.venvs/b04
 uv pip sync --python ~/.venvs/b04/bin/python requirements.txt
+```
+
+查看现有环境和运行自检。
+
+```bash
 source ~/.venvs/b04/bin/activate
 which python
 python --version

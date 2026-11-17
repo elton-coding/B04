@@ -49,7 +49,9 @@ def main() -> None:
         parser.exit(2, f"{args.task} failed: {error}\n")
 
     output_path = args.out_dir / "input_audit.json"
-    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     print(output_path)
 
 
