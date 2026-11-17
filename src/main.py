@@ -21,6 +21,8 @@ def main() -> None:
     parser.add_argument("--test", action="store_true", help="Select the test split")
     parser.add_argument("--data-root", type=Path, default=Path(os.getenv("DATA_ROOT", "/input")))
     parser.add_argument("--out-dir", type=Path, default=Path(os.getenv("OUTPUT_DIR", "/output")))
+    parser.add_argument("--model", type=Path, default=Path(os.getenv("B04_MODEL", "model/temporal.pt")),
+                        help="CUDA candidate checkpoint for --task all")
     parser.add_argument("--limit", type=positive_int, help="Process at most this many rows per input")
     args = parser.parse_args()
 
@@ -30,12 +32,15 @@ def main() -> None:
         print(json.dumps(check_cuda(), indent=2))
         return
 
-    if args.task == "all":
-        parser.exit(2, "The prediction pipeline is under development. Use audit, features, or gpu-check.\n")
-
     split = "test" if args.test else "train"
     args.out_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if args.task == "all":
+            from predict import predict
+
+            sources = find_inputs(args.data_root, "test")
+            predict(sources["A"], sources["B"], args.model, args.out_dir, args.limit)
+            return
         if args.task == "features":
             from pulse_features import write_pulse_features
 

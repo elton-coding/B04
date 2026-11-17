@@ -187,30 +187,34 @@ def association(db):
     }
 
 
-def evaluate(truth_a, truth_b, predictions, links):
+def evaluate(source_a, source_b, predictions, links, *, labeled=True):
     # Keep the multi-million-row join in a temporary SQLite file.
     with TemporaryDirectory(prefix="b04-evaluation-") as scratch:
         with closing(sqlite3.connect(Path(scratch) / "evaluation.sqlite3")) as db:
             db.executescript("PRAGMA journal_mode=OFF; PRAGMA temp_store=FILE;" + SCHEMA)
-            load(db, truth_a, TRUTH_A, "INSERT INTO truth_a VALUES(?,?,?,?,?,?,?)")
-            load(db, truth_b, TRUTH_B, """
-                INSERT INTO tracks VALUES(?,?,?,?) ON CONFLICT(s,v,track) DO UPDATE
-                SET target=CASE WHEN excluded.target=tracks.target THEN tracks.target ELSE NULL END
-            """)
-            if db.execute("SELECT 1 FROM tracks WHERE target IS NULL LIMIT 1").fetchone():
-                raise ValueError("B truth assigns inconsistent target IDs to one track")
+            if labeled:
+                load(db, source_a, TRUTH_A, "INSERT INTO truth_a VALUES(?,?,?,?,?,?,?)")
+                load(db, source_b, TRUTH_B, """
+                    INSERT INTO tracks VALUES(?,?,?,?) ON CONFLICT(s,v,track) DO UPDATE
+                    SET target=CASE WHEN excluded.target=tracks.target THEN tracks.target ELSE NULL END
+                """)
+                if db.execute("SELECT 1 FROM tracks WHERE target IS NULL LIMIT 1").fetchone():
+                    raise ValueError("B truth assigns inconsistent target IDs to one track")
+            else:
+                load(db, source_a, TRUTH_A[:4], "INSERT INTO truth_a(s,v,pulse,platform) VALUES(?,?,?,?)")
+                load(db, source_b, TRUTH_B[:3], "INSERT OR IGNORE INTO tracks(s,v,track) VALUES(?,?,?)")
             load(db, predictions, PREDICTIONS, "INSERT INTO predictions VALUES(?,?,?,?,?,?,?)", exact=True)
             load(db, links, LINKS, "INSERT INTO links VALUES(?,?,?,?,?)", exact=True, nullable=("track_id",))
             db.commit()
 
             checks = (
-                ("SELECT 1 FROM truth_a LIMIT 1", "Labeled A truth has no pulses", False),
+                ("SELECT 1 FROM truth_a LIMIT 1", "A observations have no pulses", False),
                 ("SELECT 1 FROM truth_a a WHERE NOT EXISTS (SELECT 1 FROM predictions p WHERE (p.s,p.v,p.pulse)=(a.s,a.v,a.pulse)) LIMIT 1",
-                 "A truth includes pulses without predictions", True),
+                 "A observations include pulses without predictions", True),
                 ("SELECT 1 FROM predictions p WHERE NOT EXISTS (SELECT 1 FROM truth_a a WHERE (p.s,p.v,p.pulse)=(a.s,a.v,a.pulse)) LIMIT 1",
                  "Predictions include pulses outside the evaluation set", True),
                 ("SELECT 1 FROM links l WHERE l.status='matched' AND NOT EXISTS (SELECT 1 FROM tracks b WHERE (b.s,b.v,b.track)=(l.s,l.v,l.track)) LIMIT 1",
-                 "A matched track is absent from B truth", True),
+                 "A matched track is absent from B observations", True),
             )
             for query, message, invalid_if_found in checks:
                 if bool(db.execute(query).fetchone()) == invalid_if_found:
@@ -228,6 +232,13 @@ def evaluate(truth_a, truth_b, predictions, links):
                     LIMIT 1
                 """).fetchone():
                     raise ValueError("Links must contain exactly one row for each predicted object")
+            if not labeled:
+                return {
+                    "method": "b04_structure_v1",
+                    "pulse_count": db.execute("SELECT COUNT(*) FROM truth_a").fetchone()[0],
+                    "object_count": db.execute("SELECT COUNT(*) FROM links").fetchone()[0],
+                    "matched_tracks": db.execute("SELECT COUNT(*) FROM links WHERE status='matched'").fetchone()[0],
+                }
             group_members(db, "local", "a.platform", "p.local")
             group_members(db, "by_platform", "a.platform", "p.object")
 
@@ -247,12 +258,19 @@ def evaluate(truth_a, truth_b, predictions, links):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ("truth-a", "truth-b", "pulse-predictions", "object-track-links"):
+    for option in ("pulse-predictions", "object-track-links"):
         parser.add_argument(f"--{option}", required=True, type=Path)
+    for option in ("truth-a", "truth-b", "input-a", "input-b"):
+        parser.add_argument(f"--{option}", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    labeled = bool(args.truth_a and args.truth_b and not (args.input_a or args.input_b))
+    input_only = bool(args.input_a and args.input_b and not (args.truth_a or args.truth_b))
+    if not (labeled or input_only):
+        parser.error("provide --truth-a and --truth-b to score, or --input-a and --input-b to check format")
     try:
-        report = evaluate(args.truth_a, args.truth_b, args.pulse_predictions, args.object_track_links)
+        report = evaluate(args.truth_a or args.input_a, args.truth_b or args.input_b,
+                          args.pulse_predictions, args.object_track_links, labeled=labeled)
         text = json.dumps(report, indent=2) + "\n"
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

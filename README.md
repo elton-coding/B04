@@ -1,6 +1,6 @@
 # B04 GPU 开发
 
-本仓库支持 CUDA 自检、A/B 类输入审计、GPU 脉冲特征预处理，以及本地留出评估。运行 `--task audit` 会生成 `input_audit.json`。运行 `--task features` 会分批生成保留脉冲标识的 Parquet，其中包含原观测和 GPU 计算的方位正弦、余弦。正式提交入口仍在开发。
+本仓库支持 CUDA 自检、A/B 类输入审计、GPU 脉冲特征预处理、本地留出评估，以及初版竞赛候选推理。运行 `--task audit` 会生成 `input_audit.json`。运行 `--task features` 会分批生成保留脉冲标识的 Parquet，其中包含原观测和 GPU 计算的方位正弦、余弦。
 
 ## 本机位置
 
@@ -120,6 +120,31 @@ done
 | 对象–航迹关联 | 预测对象与真值对象的脉冲集合 IoU 严格大于 0.5 时对齐。检查所连航迹的目标编号，报告匹配精确率、召回率、F1 和 `no_match` 召回率 |
 
 宏 F1 对留出集实际出现的标签等权平均。没有分母的指标写为 JSON `null`。评估器用 SQLite 临时文件处理脉冲连接，系统临时目录需要可写空间。固定留出用于同场景的时间外推比较，公开 A 榜测试集和跨场景表现需要单独验证。
+
+## CUDA 时序与航迹关联候选
+
+候选在 32 ms 和 256 ms 两个时间窗内，按平台、粗频带和方位分组，提取脉冲参数的均值、标准差、密度与相邻到达间隔。CUDA 分类网络预测每条脉冲的型号和状态。训练时提高跟踪状态的采样比例并对错误加权，推理时用训练状态频数部分抵消采样和加权造成的状态概率偏移。训练标签用于监督，留出标签用于本地评分与选择判决参数。
+
+推理时将 B 航迹位置按时刻插值，用 A 平台位置计算到各航迹的方位角。在方位测量相对明确的脉冲上估计航迹型号分布，再结合圆周方位误差、时间覆盖和型号相容性选择航迹。满足条件的脉冲按航迹编号归为对象，未关联脉冲暂按型号归组。后者需要继续解决同型号无航迹目标的分离。
+
+使用上节生成的固定切分，在 WSL 训练和评估。
+
+```bash
+source ~/.venvs/b04/bin/activate
+holdout=output/eval-reference/holdout
+run=output/temporal-reference
+python src/temporal_model.py --train-a "$holdout/train/A.csv" --output "$run/temporal.pt"
+bash run.sh --task all --data-root "$holdout/input" --model "$run/temporal.pt" \
+  --out-dir "$run/predictions"
+python src/evaluate.py --truth-a "$holdout/truth/A.csv" --truth-b "$holdout/truth/B.csv" \
+  --pulse-predictions "$run/predictions/P1A_test_pulse_predictions.csv" \
+  --object-track-links "$run/predictions/P1A_test_object_track_links.csv" \
+  --output "$run/report.json"
+```
+
+切换到官方 A 榜输入前，可在验证通过后用全部带标签训练脉冲重新训练权重。对无标签数据，把评估命令的 `--truth-a`、`--truth-b` 换成 `--input-a`、`--input-b`，分别传入官方 A、B 原始测试 CSV。该模式检查全部脉冲和关联记录的结构，并报告脉冲、对象和匹配航迹数量。建议每次打榜前保留 Git 提交号、权重、留出指标和待提交结果包。上述命令只写本地文件。
+
+构建候选镜像时，将选中的网络权重放到项目根目录下的 `model/temporal.pt`，再按上节的 Docker 命令构建。项目镜像构建只纳入这一个权重文件，Git 忽略本地权重。镜像默认运行 `--task all` 并从 `/input` 读取测试 CSV，输出命名为 `<scenario_id>_<data_version>_*.csv` 的两张结果表到 `/output`。也可以在开发时将权重只读挂载到容器，显式传给 `--model`。
 
 ## Git
 

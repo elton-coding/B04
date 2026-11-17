@@ -8,8 +8,7 @@ ENV DATA_ROOT=/input \
 WORKDIR /app/program/solution
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY run.sh .
-COPY src/ src/
+COPY . .
 RUN chmod +x run.sh
 
 ENTRYPOINT ["/app/program/solution/run.sh"]

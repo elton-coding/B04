@@ -4,4 +4,7 @@
 !run.sh
 !src/
 !src/**
+!model/
+model/**
+!model/temporal.pt
 **/__pycache__
