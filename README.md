@@ -9,6 +9,7 @@
 | Windows 项目与代码 | `D:\Source\B04`，Python 源码在 `src\` |
 | WSL 项目目录 | `/mnt/d/Source/B04` |
 | WSL 项目虚拟环境 | `~/.venvs/b04` |
+| 本机依赖轮子缓存 | `~/.cache/b04-wheels` |
 | WSL Docker 引擎配置 | `/etc/docker/daemon.json` |
 | NVIDIA 容器运行时配置 | `/etc/nvidia-container-runtime/config.toml` |
 | NVIDIA 软件源 | `/etc/apt/sources.list.d/nvidia-container-toolkit.list` |
@@ -70,6 +71,16 @@ docker run --rm --gpus all \
 proxy=http://127.0.0.1:10808
 HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" uv pip sync --python ~/.venvs/b04/bin/python requirements.txt
 docker build --network=host --build-arg HTTP_PROXY="$proxy" --build-arg HTTPS_PROXY="$proxy" -t b04-dev .
+```
+
+本机已缓存完整依赖，可在 Ubuntu 中用下列命令离线复建开发镜像。同一份代码和依赖清单仍使用根目录的 Dockerfile 作为提交构建定义。
+
+```bash
+mkdir -p .cache
+sed 's|^RUN pip install --no-cache-dir -r requirements.txt$|RUN --mount=type=bind,from=b04_wheelhouse,target=/wheels pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt|' \
+  Dockerfile > .cache/Dockerfile.b04-offline
+docker build --network=none --build-context b04_wheelhouse="$HOME/.cache/b04-wheels" \
+  -f .cache/Dockerfile.b04-offline -t b04-dev .
 ```
 
 ## Git
