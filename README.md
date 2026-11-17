@@ -1,6 +1,6 @@
 # B04 GPU 开发
 
-本仓库当前包含 CUDA 自检、A/B 类观测输入发现、字段归一化、数据检查，以及 GPU 脉冲特征预处理。运行 `--task audit` 会生成 `input_audit.json`。运行 `--task features` 会分批生成保留脉冲标识的 Parquet，其中包含原观测和 GPU 计算的方位正弦、余弦。五项预测算法和正式提交结果仍在开发。
+本仓库支持 CUDA 自检、A/B 类输入审计、GPU 脉冲特征预处理，以及本地留出评估。运行 `--task audit` 会生成 `input_audit.json`。运行 `--task features` 会分批生成保留脉冲标识的 Parquet，其中包含原观测和 GPU 计算的方位正弦、余弦。正式提交入口仍在开发。
 
 ## 本机位置
 
@@ -82,6 +82,44 @@ sed 's|^RUN pip install --no-cache-dir -r requirements.txt$|RUN --mount=type=bin
 docker build --network=none --build-context b04_wheelhouse="$HOME/.cache/b04-wheels" \
   -f .cache/Dockerfile.b04-offline -t b04-dev .
 ```
+
+## 本地留出评估
+
+赛题说明列出五项机器评分维度。公开附件未给出评分器源码、各项公式或权重。这里复算的是本地验证指标，官方 A 榜成绩以在线评测为准。
+
+使用初赛 A 榜带标签的 A/B 训练数据，按同一观测时间切分。固定验证窗口为 2026-11-10 09:06:40 至 09:08:23，含起点、排除终点。训练只用 09:06:30 之前的数据，中间保留 10 秒隔离。生成的 `input` 剥离目标标签供推理，`truth` 只供评分。比较版本时使用同一个 `split.json` 和同一份留出数据。
+
+在 WSL 项目目录执行以下命令。生成切分和基线的目标目录需为空缺路径。
+
+```bash
+source ~/.venvs/b04/bin/activate
+data_dir='/mnt/d/Source/B04/B04赛题初赛A榜训练数据-11月12日上传/B04赛题初赛A榜训练数据'
+run=output/eval-reference
+python src/make_holdout.py --data-root "$data_dir" --out-dir "$run/holdout" \
+  --validation-start 2026-11-10T09:06:40 --validation-end 2026-11-10T09:08:23 --gap-seconds 10
+python src/local_baseline.py --holdout "$run/holdout" --out-dir "$run/baselines"
+
+for model in majority gaussian; do
+  python src/evaluate.py --truth-a "$run/holdout/truth/A.csv" --truth-b "$run/holdout/truth/B.csv" \
+    --pulse-predictions "$run/baselines/$model/pulse_predictions.csv" \
+    --object-track-links "$run/baselines/$model/object_track_links.csv" \
+    --output "$run/$model.json"
+done
+```
+
+多数类基线用训练集中最常见的型号和状态作预测。CUDA 对角高斯基线用 `param1`、`param2`、`param3` 分别预测每个脉冲的型号和状态。两条基线都按预测型号归组，并把所有对象标记为 `no_match`，供后续实例级聚类和航迹匹配算法做对照。
+
+把评估命令里的两个预测路径替换成新算法的结果，即可复用同一真值。程序先检查列顺序、脉冲覆盖、枚举值、对象覆盖和航迹唯一性，再输出各项指标。
+
+| 赛题维度 | 当前本地指标 |
+|---|---|
+| 平台内脉冲分选 | 按平台计算成员重合的 B³ 精确率、召回率、F1 |
+| 目标型号 | 脉冲准确率、宏 F1、逐型号统计、混淆矩阵 |
+| 工作状态 | 脉冲准确率、宏 F1、逐状态统计、混淆矩阵 |
+| 跨平台同源融合 | 全局对象 B³，以及只统计跨平台脉冲对的精确率、召回率、F1 |
+| 对象–航迹关联 | 预测对象与真值对象的脉冲集合 IoU 严格大于 0.5 时对齐。检查所连航迹的目标编号，报告匹配精确率、召回率、F1 和 `no_match` 召回率 |
+
+宏 F1 对留出集实际出现的标签等权平均。没有分母的指标写为 JSON `null`。评估器用 SQLite 临时文件处理脉冲连接，系统临时目录需要可写空间。固定留出用于同场景的时间外推比较，公开 A 榜测试集和跨场景表现需要单独验证。
 
 ## Git
 
