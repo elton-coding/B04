@@ -125,6 +125,36 @@ def cross_platform_pairs(db):
     return scores(*difference)
 
 
+def fusion_by_platform_pair(db):
+    counts = {}
+    for index, (table, columns) in enumerate((
+        ("by_platform", ("target", "pred")),
+        ("by_platform_pred", ("pred",)),
+        ("by_platform_truth", ("target",)),
+    )):
+        # Both sides have one row per group and platform. The product counts
+        # pulse pairs across the two platforms without constructing any pairs.
+        grouping_keys = " AND ".join(f"a.{column}=b.{column}" for column in columns)
+        lookup = f"{table}_pair_lookup"
+        db.execute(f"CREATE INDEX {lookup} ON {table}(s,v,{','.join(columns)},scope)")
+        result = db.execute(f"""
+            SELECT a.s,a.v,a.scope,b.scope,SUM(a.n*b.n)
+            FROM {table} a JOIN {table} b INDEXED BY {lookup} USING(s,v)
+            WHERE a.scope < b.scope AND {grouping_keys}
+            GROUP BY a.s,a.v,a.scope,b.scope
+        """)
+        for scene, version, first, second, count in result:
+            counts.setdefault((scene, version, first, second), [0, 0, 0])[index] = count
+    return [
+        {
+            "scenario_id": scene, "data_version": version,
+            "platform_a": first, "platform_b": second,
+            **scores(*counts[scene, version, first, second]),
+        }
+        for scene, version, first, second in sorted(counts)
+    ]
+
+
 def classification(db, field, labels):
     rows = db.execute(f"""
         SELECT a.{field},p.{field},COUNT(*)
@@ -251,6 +281,7 @@ def evaluate(source_a, source_b, predictions, links, *, labeled=True):
                 "cross_platform_fusion": {
                     **clustering(db, "fused"),
                     "cross_platform_pairwise": cross_platform_pairs(db),
+                    "by_platform_pair": fusion_by_platform_pair(db),
                 },
                 "object_track_association": association(db),
             }
